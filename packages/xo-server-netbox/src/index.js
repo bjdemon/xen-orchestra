@@ -16,7 +16,7 @@ import slugify from './slugify'
 
 const log = createLogger('xo:netbox')
 
-const SUPPORTED_VERSION = '>=2.10 <4.7'
+const SUPPORTED_VERSION = '>=2.10 <4.6'
 const CLUSTER_TYPE = 'XCP-ng Pool'
 const TYPES_WITH_UUID = ['virtualization.cluster', 'virtualization.virtualmachine', 'virtualization.vminterface']
 const CHUNK_SIZE = 100
@@ -27,16 +27,6 @@ const M = 1024 ** 2
 const G = 1024 ** 3
 
 const { push } = Array.prototype
-
-const RFC1918_10 = ipaddr.parseCIDR('10.0.0.0/8')
-const RFC1918_172 = ipaddr.parseCIDR('172.16.0.0/12')
-const RFC1918_192 = ipaddr.parseCIDR('192.168.0.0/16')
-const IPV4_KIND = 'ipv4'
-const isRfc1918 = ip =>
-  ip.kind() === IPV4_KIND &&
-  (ip.match(RFC1918_10[0], RFC1918_10[1]) ||
-    ip.match(RFC1918_172[0], RFC1918_172[1]) ||
-    ip.match(RFC1918_192[0], RFC1918_192[1]))
 
 // =============================================================================
 
@@ -56,7 +46,6 @@ class Netbox {
   #syncUsers
   #token
   #xo
-  #ignoreRfc1918
 
   constructor({ xo }) {
     this.#xo = xo
@@ -64,7 +53,7 @@ class Netbox {
     this.getObject = function getObject(id) {
       try {
         return this.#xo.getObject(id)
-      } catch (err) {}
+      } catch (err) { }
     }
 
     this.getObjects = xo.getObjects.bind(xo)
@@ -77,11 +66,9 @@ class Netbox {
     }
     this.#allowUnauthorized = configuration.allowUnauthorized ?? false
     this.#syncUsers = configuration.syncUsers ?? false
-    // NetBox UI may include "Bearer " or "Token " when copying tokens: strip it if present
-    this.#token = configuration.token.replace(/^(?:Bearer|Token)\s+/i, '')
+    this.#token = configuration.token
     this.#xoPools = configuration.pools
     this.#syncInterval = configuration.syncInterval && configuration.syncInterval * 60 * 60 * 1e3
-    this.#ignoreRfc1918 = configuration.ignoreRfc1918 ?? false
 
     // We don't want to start the auto-sync if the plugin isn't loaded
     if (state.loaded) {
@@ -154,46 +141,34 @@ class Netbox {
 
     let url = this.#endpoint + '/api' + path
     const options = {
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: this.#token.startsWith('nbt_') ? `Bearer ${this.#token}` : `Token ${this.#token}`,
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: `Token ${this.#token}` },
       method,
       rejectUnauthorized: !this.#allowUnauthorized,
       timeout: REQUEST_TIMEOUT,
-      bypassStatusCheck: true, // we want to get the error body
     }
 
     const httpRequest = async () => {
-      let response
-      let resBody = 'Netbox error could not be retrieved'
       try {
-        response = await this.#xo.httpRequest(url, options)
-        if (Math.floor(response.statusCode / 100) === 2) {
-          resBody = await response.text()
-          if (resBody.length > 0) {
-            return JSON.parse(resBody)
-          }
-          return
+        const response = await this.#xo.httpRequest(url, options)
+        const resBody = await response.text()
+        if (resBody.length > 0) {
+          return JSON.parse(resBody)
         }
-        const error = new Error(`${response.statusCode} ${response.statusMessage}`)
+      } catch (error) {
+        error.method = method
+        error.requestBody = dataDebug
+
+        let resBody = 'Netbox error could not be retrieved'
         try {
-          resBody = await response.text()
+          resBody = await error.response.text()
           error.netboxError = JSON.parse(resBody)
         } catch (err) {
           log.error(err)
           // If the error couldn't be parsed, expose the response's raw body
           error.netboxError = resBody
         }
+
         throw error
-      } catch (error) {
-        // root error won't have a body , most likely an error code line ECONRESET
-        error.method = method
-        error.requestBody = dataDebug
-        error.response = response
-        throw error
-      } finally {
-        response?.destroy()
       }
     }
 
@@ -240,6 +215,7 @@ class Netbox {
     if (this.#syncUsers) {
       typesWithUuid.push('tenancy.tenant')
     }
+    typesWithUuid.push('virtualization.virtualdisk')
     if (typesWithUuid.some(type => !types.includes(type))) {
       throw new Error('UUID custom field must be assigned to types ' + typesWithUuid.join(', '))
     }
@@ -261,16 +237,6 @@ class Netbox {
 
   async #checkNetboxVersion() {
     await this.#fetchNetboxVersion()
-
-    if (
-      this.#netboxVersion !== undefined &&
-      semver.satisfies(this.#netboxVersion, '>=4.5') &&
-      !this.#token.startsWith('nbt_')
-    ) {
-      log.warn(
-        'You are using a v1 API token, which is deprecated since NetBox 4.5 and will be removed in v5.0. Please migrate to a v2 token (tokens starting with "nbt_") from your NetBox interface.'
-      )
-    }
 
     if (!this.#xo.config.getOptional('netbox.checkNetboxVersion')) {
       return
@@ -345,14 +311,14 @@ class Netbox {
       for (const nbTenant of tenantsToDelete) {
         if (
           (nbTenant.circuit_count ?? 0) +
-            (nbTenant.device_count ?? 0) +
-            (nbTenant.ipaddress_count ?? 0) +
-            (nbTenant.prefix_count ?? 0) +
-            (nbTenant.rack_count ?? 0) +
-            (nbTenant.site_count ?? 0) +
-            (nbTenant.vlan_count ?? 0) +
-            (nbTenant.vrf_count ?? 0) +
-            (nbTenant.cluster_count ?? 0) >
+          (nbTenant.device_count ?? 0) +
+          (nbTenant.ipaddress_count ?? 0) +
+          (nbTenant.prefix_count ?? 0) +
+          (nbTenant.rack_count ?? 0) +
+          (nbTenant.site_count ?? 0) +
+          (nbTenant.vlan_count ?? 0) +
+          (nbTenant.vrf_count ?? 0) +
+          (nbTenant.cluster_count ?? 0) >
           0
         ) {
           nonDeletableTenants.push(nbTenant)
@@ -499,14 +465,6 @@ class Netbox {
         // Size limit of `comments` is not specified in Netbox doc: let's use the same limit as XO
         comments: xoVm.other['xo:notes']?.slice(0, 2048).trim() ?? '',
         vcpus: xoVm.CPUs.number,
-        disk: Math.floor(
-          xoVm.$VBDs
-            .map(vbdId => this.getObject(vbdId))
-            .filter(vbd => !vbd.is_cd_drive)
-            .map(vbd => this.getObject(vbd.VDI))
-            // Storage size unit changed from GB to MB in Netbox 4.1 (https://github.com/netbox-community/netbox/releases/tag/v4.1.0)
-            .reduce((total, vdi) => total + vdi.size, 0) / (semver.satisfies(this.#netboxVersion, '^4.1') ? M : G)
-        ),
         memory: Math.floor(xoVm.memory.dynamic[1] / M),
         cluster: nbCluster.id,
         status: xoVm.power_state === 'Running' ? 'active' : 'offline',
@@ -634,7 +592,7 @@ class Netbox {
     // necessary
     const allNbVmsList = await this.#request('/virtualization/virtual-machines/?' + allClusterFilter)
     // Then get only the ones from the pools we're synchronizing
-    const nbVmsList = allNbVmsList.filter(nbVm => some(nbClusters, { id: nbVm.cluster?.id }))
+    const nbVmsList = allNbVmsList.filter(nbVm => some(nbClusters, { id: nbVm.cluster.id }))
     // Then make them objects to map the Netbox VMs to their XO VMs
     // { VM UUID → Netbox VM }
     const allNbVms = keyBy(allNbVmsList, 'custom_fields.uuid')
@@ -657,7 +615,7 @@ class Netbox {
       const nbCluster = nbClusters[xoPoolId]
 
       // Get Netbox VMs that are supposed to be in this pool
-      const xoPoolNbVms = pickBy(nbVms, nbVm => nbVm.cluster?.id === nbCluster.id)
+      const xoPoolNbVms = pickBy(nbVms, nbVm => nbVm.cluster.id === nbCluster.id)
 
       // For each XO VM of this pool (I)
       for (const xoVm of Object.values(xoPoolVms)) {
@@ -804,6 +762,92 @@ class Netbox {
 
     Object.assign(nbIfs, keyBy(newIfs, 'custom_fields.uuid'))
 
+    // Virtual Disks -----------------------------------------------------------
+
+    log.info('Synchronizing Virtual Disks')
+
+      const createNbDisk = (xoVdi, xoVbd, xoVm) => {
+        const name = xoVdi.name_label || `Disk ${xoVbd.userdevice || xoVbd.device}`
+        const nbVm = nbVms[xoVm.uuid]
+
+        const nbDisk = {
+          custom_fields: { uuid: xoVdi.uuid },
+          name: name.slice(0, NAME_MAX_LENGTH).trim(),
+          size: Math.floor(xoVdi.size / M),
+        }
+
+        if (nbVm !== undefined) {
+          nbDisk.virtual_machine = nbVm.id
+        }
+
+        return nbDisk
+      }
+
+      const nbDisksList = await this.#request(`/virtualization/virtual-disks/?${clusterFilter}`)
+      // { ID → Disk }
+      const nbDisks = keyBy(nbDisksList, 'custom_fields.uuid')
+      delete nbDisks.null
+
+      const disksToDelete = []
+      const disksToUpdate = []
+      const disksToCreate = []
+      for (const nbVm of Object.values(nbVms)) {
+        const xoVm = this.getObject(nbVm.custom_fields.uuid)
+        if (xoVm === undefined) {
+          log.warn('Synchronizing Virtual Disks: cannot find VM from UUID custom field', { vm: nbVm.custom_fields.uuid })
+          continue
+        }
+
+        const xoVbds = xoVm.$VBDs
+          .map(vbdId => this.getObject(vbdId))
+          .filter(vbd => vbd && !vbd.is_cd_drive)
+
+        const xoVdis = xoVbds.map(vbd => this.getObject(vbd.VDI)).filter(vdi => vdi !== undefined)
+
+        // Start by deleting old disks attached to this Netbox VM
+        // Loop over the array to make sure disks with a `null` UUID also get deleted
+        nbDisksList.forEach(nbDisk => {
+          const xoVdiId = nbDisk.custom_fields.uuid
+          if (nbDisk.virtual_machine.id === nbVm.id && !xoVdis.some(vdi => vdi.uuid === xoVdiId)) {
+            disksToDelete.push({ id: nbDisk.id })
+            delete nbDisks[xoVdiId]
+          }
+        })
+
+        const usedDiskNames = nbDisksList
+          .filter(nbDisk => nbDisk.virtual_machine.id === nbVm.id && nbDisk.custom_fields.uuid == null)
+          .map(nbDisk => nbDisk.name)
+
+        // For each XO VBD, create or update the Netbox disk
+        for (const xoVbd of xoVbds) {
+          const xoVdi = this.getObject(xoVbd.VDI)
+          if (!xoVdi) continue
+
+          const nbDisk = nbDisks[xoVdi.uuid]
+          const updatedDisk = createNbDisk(xoVdi, xoVbd, xoVm)
+          updatedDisk.name = deduplicateName(updatedDisk.name, usedDiskNames)
+          usedDiskNames.push(updatedDisk.name)
+
+          if (nbDisk === undefined) {
+            disksToCreate.push(updatedDisk)
+          } else {
+            // `virtual_machine` needs to be flattened so we can compare the 2 objects
+            const patch = diff(updatedDisk, { ...nbDisk, virtual_machine: nbDisk.virtual_machine.id })
+            if (patch !== undefined) {
+              disksToUpdate.push(patch)
+            }
+          }
+        }
+      }
+
+      // Perform calls to Netbox
+      const newDisks = []
+      await this.#request('/virtualization/virtual-disks/', 'DELETE', disksToDelete)
+      newDisks.push(...(await this.#request('/virtualization/virtual-disks/', 'PATCH', disksToUpdate)))
+      newDisks.push(...(await this.#request('/virtualization/virtual-disks/', 'POST', disksToCreate)))
+
+      Object.assign(nbDisks, keyBy(newDisks, 'custom_fields.uuid'))
+
     // IPs ---------------------------------------------------------------------
 
     log.info('Synchronizing IP addresses')
@@ -861,10 +905,6 @@ class Netbox {
             continue
           }
           const ipKind = parsedIp.kind()
-
-          if (this.#ignoreRfc1918 && isRfc1918(parsedIp)) {
-            continue
-          }
 
           // Find the smallest prefix within Netbox's existing prefixes
           // Users must create prefixes themselves
